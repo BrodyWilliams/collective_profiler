@@ -785,8 +785,8 @@ int _mpi_init(int *argc, char ***argv)
 
 	ret = PMPI_Init(argc, argv);
 
-	MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
-	MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+	PMPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+	PMPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
 	// We do not know what rank will gather alltoall data since alltoall can
 	// be called on any communicator
@@ -822,7 +822,68 @@ int _mpi_init(int *argc, char ***argv)
 #endif
 
 	// Make sure we do not create an articial imbalance between ranks.
-	MPI_Barrier(MPI_COMM_WORLD);
+	PMPI_Barrier(MPI_COMM_WORLD);
+
+	return ret;
+}
+
+int _mpi_init_thread(int *argc, char ***argv, int required, int *provided)
+{
+	int ret;
+	char buf[200];
+
+	char *num_call_envvar = getenv(NUM_CALL_START_PROFILING_ENVVAR);
+	if (num_call_envvar != NULL)
+	{
+		_num_call_start_profiling = atoi(num_call_envvar);
+	}
+
+	char *limit_a2a_calls = getenv(LIMIT_ALLTOALL_CALLS_ENVVAR);
+	if (limit_a2a_calls != NULL)
+	{
+		_limit_av_calls = atoi(limit_a2a_calls);
+	}
+
+	ret = PMPI_Init_thread(argc, argv, required, provided);
+
+	PMPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+	PMPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+	// We do not know what rank will gather alltoall data since alltoall can
+	// be called on any communicator
+	int jobid = get_job_id();
+	logger_config_t alltoall_logger_cfg;
+	alltoall_logger_cfg.get_full_filename = &alltoall_get_full_filename;
+	alltoall_logger_cfg.collective_name = "Alltoall";
+	alltoall_logger_cfg.limit_number_calls = DEFAULT_LIMIT_ALLTOALL_CALLS;
+	logger = logger_init(jobid, world_rank, world_size, &alltoall_logger_cfg);
+	assert(logger);
+
+	// Allocate buffers reused between alltoall calls
+	// Note the buffer may be used on a communicator that is not comm_world
+	// but in any case, it will be smaller or of the same size than comm_world.
+	// So we allocate the biggest buffers possible but reuse them during the
+	// entire execution of the application.
+    // for alltoall the buffer size is smaller than for alltoallv because each rank has 1x int sendcount, not sendcounts[world_size]
+	sbuf = (int *)malloc(world_size * (sizeof(int)));
+	assert(sbuf);
+	rbuf = (int *)malloc(world_size * (sizeof(int)));
+	assert(rbuf);
+#if ENABLE_EXEC_TIMING
+	op_exec_times = (double *)malloc(world_size * sizeof(double));
+	assert(op_exec_times);
+#endif // ENABLE_EXEC_TIMING
+#if ENABLE_LATE_ARRIVAL_TIMING
+	late_arrival_timings = (double *)malloc(world_size * sizeof(double));
+	assert(late_arrival_timings);
+#endif // ENABLE_LATE_ARRIVAL_TIMING
+
+#if ENABLE_VALIDATION
+	srand((unsigned)getpid());
+#endif
+
+	// Make sure we do not create an articial imbalance between ranks.
+	PMPI_Barrier(MPI_COMM_WORLD);
 
 	return ret;
 }
@@ -834,9 +895,30 @@ int MPI_Finalize()
 	return PMPI_Finalize();
 }
 
+int MPI_Init_thread(int *argc, char ***argv, int required, int *provided)
+{
+	return _mpi_init_thread(argc, argv, required, provided);
+}
+
 int MPI_Init(int *argc, char ***argv)
 {
 	return _mpi_init(argc, argv);
+}
+
+int mpi_init_thread(MPI_Fint *required, MPI_Fint *provided, MPI_Fint *ierr)
+{
+	int c_ierr;
+	int argc = 0;
+	char **argv = NULL;
+    int c_provided;
+
+	c_ierr = _mpi_init_thread(&argc, &argv, OMPI_FINT_2_INT(*required), &c_provided);
+	if (NULL != ierr){
+		*ierr = OMPI_INT_2_FINT(c_ierr);
+    }
+    if (MPI_SUCCESS == c_ierr){
+        *provided = OMPI_INT_2_FINT(c_provided);
+    }
 }
 
 int mpi_init_(MPI_Fint *ierr)
@@ -1020,7 +1102,7 @@ static void save_counts(int *sendcounts, int *recvcounts, int s_datatype_size, i
 		fprintf(f, "\n");
 	}
 // #else
-	// fprintf(f, "%d\n", sendcounts[0]);
+//	 fprintf(f, "%d\n", sendcounts[0]);
 // #endif
 
 	fprintf(f, "\n\nRecv counts\n");
@@ -1051,9 +1133,9 @@ int _mpi_alltoall(const void *sendbuf, const int sendcount, MPI_Datatype sendtyp
 	int my_comm_rank;
 	char *collective_name = "alltoall";
 
-	MPI_Comm_size(comm, &comm_size);
-	MPI_Comm_rank(comm, &my_comm_rank);
-	MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+	PMPI_Comm_size(comm, &comm_size);
+	PMPI_Comm_rank(comm, &my_comm_rank);
+	PMPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 
 #if ENABLE_BACKTRACE
 	if (my_comm_rank == 0)
@@ -1117,8 +1199,8 @@ int _mpi_alltoall(const void *sendbuf, const int sendcount, MPI_Datatype sendtyp
 		// parameters are int MPI_Gather(const void *sendbuf, int sendcount, MPI_Datatype sendtype,
 		// void *recvbuf, int recvcount, MPI_Datatype recvtype, int root,
 		// MPI_Comm comm)
-		MPI_Gather(&sendcount, 1, MPI_INT, sbuf, 1, MPI_INT, 0, comm);
-		MPI_Gather(&recvcount, 1, MPI_INT, rbuf, 1, MPI_INT, 0, comm);
+		PMPI_Gather(&sendcount, 1, MPI_INT, sbuf, 1, MPI_INT, 0, comm);
+		PMPI_Gather(&recvcount, 1, MPI_INT, rbuf, 1, MPI_INT, 0, comm);
 #if DEBUG
 		printf("DEBUG: sendcounts just after gather\n");
 		for (int _rank=0; _rank<comm_size; _rank++) printf("%i ", sbuf[_rank]);
@@ -1129,9 +1211,11 @@ int _mpi_alltoall(const void *sendbuf, const int sendcount, MPI_Datatype sendtyp
 		fflush(stdout);
 #endif
 #else 
+        assert(sbuf != NULL);
+        assert(rbuf != NULL);
 		for (int _rank=0; _rank<comm_size; _rank++){
-			// sbuf[0] = sendcount;  // so this assumes all ranks have used the same count, and records that value just once.
-			// rbuf[0] = recvcount;
+			//sbuf[0] = sendcount;  // so this assumes all ranks have used the same count, and records that value just once.
+			//rbuf[0] = recvcount;
 			sbuf[_rank] = sendcount;
 			rbuf[_rank] = recvcount;
 		}
@@ -1139,11 +1223,11 @@ int _mpi_alltoall(const void *sendbuf, const int sendcount, MPI_Datatype sendtyp
 
 
 #if ENABLE_EXEC_TIMING
-		MPI_Gather(&t_op, 1, MPI_DOUBLE, op_exec_times, 1, MPI_DOUBLE, 0, comm);
+		PMPI_Gather(&t_op, 1, MPI_DOUBLE, op_exec_times, 1, MPI_DOUBLE, 0, comm);
 #endif // ENABLE_EXEC_TIMING
 
 #if ENABLE_LATE_ARRIVAL_TIMING
-		MPI_Gather(&t_arrival, 1, MPI_DOUBLE, late_arrival_timings, 1, MPI_DOUBLE, 0, comm);
+		PMPI_Gather(&t_arrival, 1, MPI_DOUBLE, late_arrival_timings, 1, MPI_DOUBLE, 0, comm);
 #endif // ENABLE_LATE_ARRIVAL_TIMING
 
 #if ENABLE_LOCATION_TRACKING
@@ -1157,16 +1241,16 @@ int _mpi_alltoall(const void *sendbuf, const int sendcount, MPI_Datatype sendtyp
 		char *hostnames = (char *)malloc(256 * comm_size * sizeof(char));
 		assert(hostnames);
 
-		MPI_Gather(&my_pid, 1, MPI_INT, pids, 1, MPI_INT, 0, comm);
-		MPI_Gather(&world_rank, 1, MPI_INT, world_comm_ranks, 1, MPI_INT, 0, comm);
-		MPI_Gather(&hostname, 256, MPI_CHAR, hostnames, 256, MPI_CHAR, 0, comm);
+		PMPI_Gather(&my_pid, 1, MPI_INT, pids, 1, MPI_INT, 0, comm);
+		PMPI_Gather(&world_rank, 1, MPI_INT, world_comm_ranks, 1, MPI_INT, 0, comm);
+		PMPI_Gather(&hostname, 256, MPI_CHAR, hostnames, 256, MPI_CHAR, 0, comm);
 		if (my_comm_rank == 0)
 		{
 			int rc = commit_rank_locations(collective_name, comm, comm_size, world_rank, my_comm_rank, pids, world_comm_ranks, hostnames, avCalls);
 			if (rc)
 			{
 				fprintf(stderr, "save_rank_locations() failed: %d", rc);
-				MPI_Abort(MPI_COMM_WORLD, 1);
+				PMPI_Abort(MPI_COMM_WORLD, 1);
 			}
 		}
 #endif // ENABLE_LOCATION_TRACKING
@@ -1179,19 +1263,19 @@ int _mpi_alltoall(const void *sendbuf, const int sendcount, MPI_Datatype sendtyp
 
 #if ((ENABLE_RAW_DATA || ENABLE_PER_RANK_STATS || ENABLE_VALIDATION) && ENABLE_COMPACT_FORMAT)
 			int s_dt_size, r_dt_size;
-			MPI_Type_size(sendtype, &s_dt_size);
-			MPI_Type_size(recvtype, &r_dt_size);
+			PMPI_Type_size(sendtype, &s_dt_size);
+			PMPI_Type_size(recvtype, &r_dt_size);
 			if (insert_sendrecv_count_data(sbuf, rbuf, comm_size, s_dt_size, r_dt_size)) // perhaps change comm_size => 1 here??? no
 			{
 				fprintf(stderr, "[%s:%d][ERROR] unable to insert send/recv counts\n", __FILE__, __LINE__);
-				MPI_Abort(MPI_COMM_WORLD, 1);
+				PMPI_Abort(MPI_COMM_WORLD, 1);
 			}
 #endif // ((ENABLE_RAW_DATA || ENABLE_PER_RANK_STATS || ENABLE_VALIDATION) && ENABLE_COMPACT_FORMAT)
 
 #if ((ENABLE_RAW_DATA || ENABLE_PER_RANK_STATS || ENABLE_VALIDATION) && !ENABLE_COMPACT_FORMAT)
 			int s_dt_size, r_dt_size;
-			MPI_Type_size(sendtype, &s_dt_size);
-			MPI_Type_size(recvtype, &r_dt_size);
+			PMPI_Type_size(sendtype, &s_dt_size);
+			PMPI_Type_size(recvtype, &r_dt_size);
 			save_counts(sbuf, rbuf, s_dt_size, r_dt_size, comm_size, avCalls);
 #endif // ((ENABLE_RAW_DATA || ENABLE_PER_RANK_STATS || ENABLE_VALIDATION) && !ENABLE_COMPACT_FORMAT)
 
@@ -1205,7 +1289,7 @@ int _mpi_alltoall(const void *sendbuf, const int sendcount, MPI_Datatype sendtyp
 			if (rc)
 			{
 				fprintf(stderr, "commit_timings() failed: %d\n", rc);
-				MPI_Abort(MPI_COMM_WORLD, 1);
+				PMPI_Abort(MPI_COMM_WORLD, 1);
 			}
 #endif // ENABLE_EXEC_TIMING
 
@@ -1215,7 +1299,7 @@ int _mpi_alltoall(const void *sendbuf, const int sendcount, MPI_Datatype sendtyp
 			if (rc)
 			{
 				fprintf(stderr, "commit_timings() failed: %d\n", rc);
-				MPI_Abort(MPI_COMM_WORLD, 1);
+				PMPI_Abort(MPI_COMM_WORLD, 1);
 			}
 #endif // ENABLE_LATE_ARRIVAL_TIMING
 			avCallsLogged++;
@@ -1230,7 +1314,7 @@ int _mpi_alltoall(const void *sendbuf, const int sendcount, MPI_Datatype sendtyp
 #if SYNC
 	// We sync all the ranks again to make sure that rank 0, who does some calculations,
 	// does not artificially fall behind.
-	MPI_Barrier(comm);
+	PMPI_Barrier(comm);
 #endif
 
 	char *need_data_commit_str = getenv(A2A_COMMIT_PROFILER_DATA_AT_ENVVAR);
@@ -1245,7 +1329,7 @@ int _mpi_alltoall(const void *sendbuf, const int sendcount, MPI_Datatype sendtyp
 		}
 	}
 
-	if (need_to_free_data != NULL && need_to_free_data != "0")
+	if (need_to_free_data != NULL && strncmp(need_to_free_data,"0",1) != 0)
 	{
 		_release_profiling_resources();
 	}
@@ -1262,8 +1346,8 @@ int MPI_Alltoall(const void *sendbuf, const int sendcount, MPI_Datatype sendtype
 	return _mpi_alltoall(sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype, comm);
 }
 
-void mpi_alltoall_(void *sendbuf, MPI_Fint sendcount,  MPI_Fint *sendtype,
-					void *recvbuf, MPI_Fint recvcount,  MPI_Fint *recvtype,
+void mpi_alltoall_(void *sendbuf, MPI_Fint *sendcount,  MPI_Fint *sendtype,
+					void *recvbuf, MPI_Fint *recvcount,  MPI_Fint *recvtype,
 					MPI_Fint *comm, MPI_Fint *ierr)
 {
 	int c_ierr;
@@ -1279,10 +1363,10 @@ void mpi_alltoall_(void *sendbuf, MPI_Fint sendcount,  MPI_Fint *sendtype,
 	recvbuf = (char *)OMPI_F2C_BOTTOM(recvbuf);
 
 	c_ierr = MPI_Alltoall(sendbuf,
-						   (int)OMPI_FINT_2_INT(sendcount),
+						   (int)OMPI_FINT_2_INT(*sendcount),
 						   c_sendtype,
 						   recvbuf,
-						   (int)OMPI_FINT_2_INT(recvcount),
+						   (int)OMPI_FINT_2_INT(*recvcount),
 						   c_recvtype, c_comm);
 	if (NULL != ierr)
 		*ierr = OMPI_INT_2_FINT(c_ierr);
